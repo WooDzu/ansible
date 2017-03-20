@@ -261,6 +261,11 @@ try:
     HAS_BOTO = True
 except ImportError:
     HAS_BOTO = False
+try:
+    import boto3
+    HAS_BOTO3 = True
+except ImportError:
+    HAS_BOTO3 = False
 
 
 def get_volume(module, ec2):
@@ -379,9 +384,60 @@ def create_volume(module, ec2, zone):
                 ec2.create_tags([volume.id], tags)
         except boto.exception.BotoServerError as e:
             module.fail_json(msg = "%s: %s" % (e.error_code, e.error_message))
+    else:
+        changed = modify_volume(module, ec2, volume)
 
     return volume, changed
 
+def get_boto3_ec2_connection(module):
+    try:
+        region, ec2_url, aws_connect_kwargs = get_aws_connection_info(module, boto3=True)
+        if not region:
+            module.fail_json(msg="region must be specified")
+        return boto3_conn(module, conn_type='client', resource='ec2', region=region, endpoint=ec2_url, **aws_connect_kwargs)
+    except boto.exception.NoAuthHandlerFound, e:
+        module.fail_json(msg="Can't authorize connection - "+str(e))
+
+def modify_volume(module, ec2, volume):
+
+    changed = False
+    volume_size = module.params.get('volume_size')
+    volume_type = module.params.get('volume_type')
+    volume_iops = module.params.get('iops')
+    change_attributes = dict(VolumeId=volume.id, VolumeType=volume.type)
+
+    # If custom iops is defined we use volume_type "io1" rather than the default of "standard"
+    if volume_iops:
+        volume_type = 'io1'
+
+    if volume_size and int(volume_size) > volume.size:
+        change_attributes['Size'] = int(volume_size);
+        changed = True
+
+    if volume_type and volume_type != volume.type:
+        change_attributes['VolumeType'] = volume_type;
+        changed = True
+
+    if volume_iops and int(volume_iops) != volume.iops:
+        change_attributes['Iops'] = int(volume_iops);
+        changed = True
+
+    if changed:
+        try:
+            ec2_boto3 = get_boto3_ec2_connection(module)
+            modification_response = ec2_boto3.modify_volume(**change_attributes)
+            modification = modification_response['VolumeModification']
+
+            # Wait until the state is 'optimizing' | 'completed' | 'failed'
+            while modification['ModificationState'] == 'modifying':
+                time.sleep(5)
+                modifications = ec2_boto3.describe_volumes_modifications(VolumeIds=[volume.id])
+                modification = modifications['VolumesModifications'][0]
+
+        except botocore.exceptions.ClientError as e:
+            module.fail_json(msg=str(e))
+
+    return changed
 
 def attach_volume(module, ec2, volume, instance):
 
@@ -529,6 +585,8 @@ def main():
 
     if not HAS_BOTO:
         module.fail_json(msg='boto required for this module')
+    if not HAS_BOTO3:
+        module.fail_json(msg='boto3 required for this module')
 
     id = module.params.get('id')
     name = module.params.get('name')
@@ -599,10 +657,12 @@ def main():
         # Check if there is a volume already mounted there.
         if device_name:
             if device_name in inst.block_device_mapping:
+                volume = ec2.get_all_volumes(volume_ids=[inst.block_device_mapping[device_name].volume_id])[0]
+                changed = modify_volume(module, ec2, volume)
                 module.exit_json(msg="Volume mapping for %s already exists on instance %s" % (device_name, instance),
-                                 volume_id=inst.block_device_mapping[device_name].volume_id,
+                                 volume_id=volume.id,
                                  device=device_name,
-                                 changed=False)
+                                 changed=changed)
 
     # Delaying the checks until after the instance check allows us to get volume ids for existing volumes
     # without needing to pass an unused volume_size
